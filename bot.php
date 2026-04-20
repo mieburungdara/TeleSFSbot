@@ -94,7 +94,7 @@ class SubForSubBot {
         if ($isAdmin) {
             // Bot added as admin
             $this->upsertChannel($channelId, $ownerId, $channelTitle, true);
-            $this->telegram->sendMessage($ownerId, "✅ Bot has been added as admin to your channel <b>{$channelTitle}</b>.\n\nYou can now create sub-for-sub agreements!");
+            $this->telegram->sendMessage($ownerId, "✅ Bot has been added as admin to your channel <b>" . $this->sanitizeHtml($channelTitle) . "</b>.\n\nYou can now create sub-for-sub agreements!");
         } else {
             // Bot removed from channel
             $this->updateChannelAdminStatus($channelId, false);
@@ -134,7 +134,7 @@ class SubForSubBot {
 
                 // Notify counter-party
                 $message = "⚠️ <b>Agreement Compromised!</b>\n\n";
-                $message .= "The owner of channel <b>{$channelTitle}</b> has removed the bot.\n\n";
+                $message .= "The owner of channel <b>" . $this->sanitizeHtml($channelTitle) . "</b> has removed the bot.\n\n";
                 $message .= "You should manually unfollow this channel to protect yourself.";
                 
                 $this->telegram->sendMessage($victimId, $message);
@@ -193,37 +193,70 @@ class SubForSubBot {
             )
         ", [$userId, $channelId, $userId, $channelId]);
 
-        foreach ($agreements as $agreement) {
-            // Determine cheater and victim
-            if ($agreement['user_a_id'] == $userId && $agreement['channel_b_id'] == $channelId) {
-                $cheaterId = $userId;
-                $victimId = $agreement['user_b_id'];
-                $cheaterChannelId = $agreement['channel_a_id'];
-                $cheaterChannelTitle = $agreement['channel_a_title'];
-            } else {
-                $cheaterId = $userId;
-                $victimId = $agreement['user_a_id'];
-                $cheaterChannelId = $agreement['channel_b_id'];
-                $cheaterChannelTitle = $agreement['channel_b_title'];
-            }
+        try {
+            $this->db->beginTransaction();
+            
+            // Lock agreements for update to prevent race conditions
+            $agreements = $this->db->fetchAll("
+                SELECT a.*, 
+                    c_a.channel_title as channel_a_title,
+                    c_b.channel_title as channel_b_title
+                FROM agreements a
+                LEFT JOIN channels c_a ON a.channel_a_id = c_a.channel_id
+                LEFT JOIN channels c_b ON a.channel_b_id = c_b.channel_id
+                WHERE a.status = 'active'
+                AND (
+                    (a.user_a_id = ? AND a.channel_b_id = ?) OR
+                    (a.user_b_id = ? AND a.channel_a_id = ?)
+                )
+                FOR UPDATE
+            ", [$userId, $channelId, $userId, $channelId]);
+
+            foreach ($agreements as $agreement) {
+                // Determine cheater and victim
+                if ($agreement['user_a_id'] == $userId && $agreement['channel_b_id'] == $channelId) {
+                    $cheaterId = $userId;
+                    $victimId = $agreement['user_b_id'];
+                    $cheaterChannelId = $agreement['channel_a_id'];
+                    $cheaterChannelTitle = $agreement['channel_a_title'];
+                } else {
+                    $cheaterId = $userId;
+                    $victimId = $agreement['user_a_id'];
+                    $cheaterChannelId = $agreement['channel_b_id'];
+                    $cheaterChannelTitle = $agreement['channel_b_title'];
+                }
+
+                // Mark agreement as flagged
+                $this->db->execute("
+                    UPDATE agreements 
+                    SET status = 'flagged' 
+                    WHERE id = ? AND status = 'active'
+                ", [$agreement['id']]);
 
             // Send alert to victim
             $message = "🚨 <b>CHEATING DETECTED!</b>\n\n";
-            $message .= "A user has unfollowed your channel <b>{$chat['title']}</b> despite being in a sub-for-sub agreement.\n\n";
-            $message .= "Cheater's channel: <b>{$cheaterChannelTitle}</b>\n\n";
+            $message .= "A user has unfollowed your channel <b>" . $this->sanitizeHtml($chat['title']) . "</b> despite being in a sub-for-sub agreement.\n\n";
+            $message .= "Cheater's channel: <b>" . $this->sanitizeHtml($cheaterChannelTitle) . "</b>\n\n";
             $message .= "You can retaliate by removing them from your channel.";
 
-            // Create retaliation button
-            $keyboard = $this->telegram->createInlineKeyboard([
-                [
+                // Create retaliation button
+                $keyboard = $this->telegram->createInlineKeyboard([
                     [
-                        'text' => '🚫 Unfollow Back (Ban)',
-                        'callback_data' => "retaliate_user_{$cheaterId}_channel_{$cheaterChannelId}"
+                        [
+                            'text' => '🚫 Unfollow Back (Ban)',
+                            'callback_data' => "retaliate_user_{$cheaterId}_channel_{$cheaterChannelId}"
+                        ]
                     ]
-                ]
-            ]);
+                ]);
 
-            $this->telegram->sendMessage($victimId, $message, $keyboard);
+                $this->telegram->sendMessage($victimId, $message, $keyboard);
+            }
+
+            $this->db->commit();
+        } catch (Exception $e) {
+            $this->db->rollBack();
+            $this->logError('Failed to process user leave event: ' . $e->getMessage());
+            throw $e;
         }
     }
 
@@ -291,8 +324,8 @@ class SubForSubBot {
                 } else {
                     $response = "📋 <b>Your Channels:</b>\n\n";
                     foreach ($channels as $channel) {
-                        $response .= "• {$channel['channel_title']}\n";
-                        $response .= "  ID: <code>{$channel['channel_id']}</code>\n\n";
+                        $response .= "• " . $this->sanitizeHtml($channel['channel_title']) . "\n";
+                        $response .= "  ID: <code>" . $this->sanitizeHtml((string)$channel['channel_id']) . "</code>\n\n";
                     }
                     $this->telegram->sendMessage($chatId, $response);
                 }
@@ -315,9 +348,21 @@ class SubForSubBot {
     }
 
     private function handleRetaliation(string $callbackId, int $victimId, string $data): void {
+        // Rate limiting - 1 action per 3 seconds per user
+        $rateLimitKey = 'retaliate_' . $victimId;
+        $rateLimitFile = sys_get_temp_dir() . '/' . $rateLimitKey;
+        
+        if (file_exists($rateLimitFile) && (time() - filemtime($rateLimitFile)) < 3) {
+            $this->telegram->answerCallbackQuery($callbackId, 'Please wait a moment before trying again', true);
+            return;
+        }
+        
+        touch($rateLimitFile);
+
         // Parse callback data
         if (!preg_match('/retaliate_user_(\d+)_channel_(\d+)/', $data, $matches)) {
             $this->telegram->answerCallbackQuery($callbackId, 'Invalid request', true);
+            unlink($rateLimitFile);
             return;
         }
 
@@ -328,6 +373,7 @@ class SubForSubBot {
         if ($cheaterId <= 0 || $cheaterChannelId == 0 || $victimId <= 0) {
             $this->telegram->answerCallbackQuery($callbackId, 'Invalid request parameters', true);
             $this->logError("Invalid retaliation request: cheaterId={$cheaterId}, channelId={$cheaterChannelId}, victimId={$victimId}");
+            unlink($rateLimitFile);
             return;
         }
 
@@ -347,6 +393,7 @@ class SubForSubBot {
 
         if (!$agreement) {
             $this->telegram->answerCallbackQuery($callbackId, 'Agreement no longer active', true);
+            unlink($rateLimitFile);
             return;
         }
 
@@ -365,6 +412,7 @@ class SubForSubBot {
 
         if (!$channel) {
             $this->telegram->answerCallbackQuery($callbackId, 'You are not the owner of this channel', true);
+            unlink($rateLimitFile);
             return;
         }
 
@@ -382,19 +430,36 @@ class SubForSubBot {
             $this->telegram->answerCallbackQuery($callbackId, '✅ User has been banned from your channel!', true);
             
             // Notify both parties
-            $this->telegram->sendMessage($victimId, "✅ You have banned the cheater from your channel <b>{$channel['channel_title']}</b>.\n\nAgreement has been canceled.");
-            $this->telegram->sendMessage($cheaterId, "⚠️ You have been banned from <b>{$channel['channel_title']}</b> for violating the sub-for-sub agreement.\n\nAgreement has been canceled.");
+            $this->telegram->sendMessage($victimId, "✅ You have banned the cheater from your channel <b>" . $this->sanitizeHtml($channel['channel_title']) . "</b>.\n\nAgreement has been canceled.");
+            $this->telegram->sendMessage($cheaterId, "⚠️ You have been banned from <b>" . $this->sanitizeHtml($channel['channel_title']) . "</b> for violating the sub-for-sub agreement.\n\nAgreement has been canceled.");
         } else {
             $this->telegram->answerCallbackQuery($callbackId, '❌ Failed to ban user. Please check bot permissions.', true);
         }
+        
+        // Clean up rate limit
+        unlink($rateLimitFile);
+    }
+
+    /**
+     * Sanitize text for HTML output in Telegram messages
+     * Prevents XSS and HTML injection attacks
+     */
+    private function sanitizeHtml(?string $text): string {
+        if ($text === null) {
+            return '';
+        }
+        return htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE | ENT_HTML5, 'UTF-8');
     }
 
     private function upsertUser(int $telegramId, ?string $username): void {
+        // Sanitize username before storing
+        $sanitizedUsername = $username ? trim($username) : null;
+        
         $this->db->execute("
             INSERT INTO users (telegram_id, username) 
             VALUES (?, ?)
             ON DUPLICATE KEY UPDATE username = VALUES(username)
-        ", [$telegramId, $username]);
+        ", [$telegramId, $sanitizedUsername]);
     }
 
     private function upsertChannel(int $channelId, int $ownerId, string $title, bool $isAdmin): void {

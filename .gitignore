@@ -1,1 +1,5 @@
 .kilo
+bot.log
+*.log
+.env
+config.local.php
